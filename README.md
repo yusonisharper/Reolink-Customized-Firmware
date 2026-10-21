@@ -1,3 +1,8 @@
+# Firmware Usage:
+1. Flash your B800 to latest official firmware, wait for camera back on
+2. Flash the customized firmware, wait for camera back to online. This step should takes longer, ETA 5 > mins.
+3. Create camera password if you didn't, then use admin + password created for ONVIF or RTSP. Enjoy!
+
 # Reolink B800 (IPC_5158M8M_V2) Firmware Mod
 
 Reverse-engineering and rebuilding the firmware of a Reolink B800 v2 IP camera to add
