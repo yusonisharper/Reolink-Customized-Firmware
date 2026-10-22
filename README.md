@@ -3,7 +3,7 @@
 2. Flash the customized firmware, wait for camera back to online. This step should takes longer, ETA 5 mins.
 3. Create camera password if you didn't, then use admin + password created for ONVIF or RTSP. Enjoy!
 
-# Reolink B800 (IPC_5158M8M_V2) Firmware Mod
+# Reolink B800 (v2) Firmware Mod
 
 Reverse-engineering and rebuilding the firmware of a Reolink B800 v2 IP camera to add
 **ONVIF**, **RTSP**, and **corridor mode** — features the stock firmware ships but keeps
@@ -22,10 +22,11 @@ locked on this standalone model — while keeping the device stable.
 | ONVIF | Working | Port 8000, device discoverable and connectable |
 | RTSP | Working | Port 554 |
 | Corridor mode | Working | `support_corridor_mode="1"` + corridor AI model added |
+| Intelligent H.265+ | Working | EVBR + MAQ rate control ported from the RP-PCB8MZ via a boot-time script |
 | Auto-reboot / crash | Fixed | Was caused by a Linux/HDAL RAM-split that starved Linux |
 | Debug backdoor | Removed in final build | telnet (`bindshell`) and the `trace.so` tracer are diagnostic-only |
 
-All three features were confirmed working on-device after flashing.
+All features were confirmed working on-device after flashing.
 
 ---
 
@@ -112,7 +113,27 @@ avoid needless flash writes).
   `syscall(SYS_socket/bind/listen, …)` directly — needing only `syscall@GLIBC_2.4` — fixed
   it.
 
-### 5. AI models (`ppvd.bin`) are not portable across camera models
+### 5. Intelligent H.265+ ported from a different model, in userspace
+
+The B800's `device` binary has no "Intelligent H.265+" code — its static HDAL build lacks
+`EVBR_AUTO` and `OUT_H26X_MAQ_DIFF`, and no app knows `support_smart_265`, so there is no UI
+for it. But the B800 **kernel drivers do** expose the needed knobs from shell:
+
+- `/proc/hdal/venc/cmd` — `vdoenc setevbr <path> <21 ints>` sets EVBR rate control live.
+- `/proc/kdrv_vdocdc/diff_maq` — `<ch> <en> <str> <idx1> <idx2>` sets the MAQ diff, whose
+  struct is identical to the RP-PCB8MZ's.
+- `vdoenc encinfo <p>` dumps per-path Codec / RC Mode / W / H / BitRate / Fps to dmesg.
+
+So instead of patching `device`, the feature is a small boot script (`/mnt/app/smart265.sh`)
+that waits for the encoders to come up, auto-detects the main stream path (largest W×H),
+and — only for H.265 — applies EVBR (with per-level GOP, QP, MotionAQ, StillFrameCnd and
+MotionRatioThd) plus the MAQ diff, matching the RP-PCB8MZ's values. It re-checks every 30 s
+and re-applies if `device` resets the encoder (e.g. after a settings change in the app). JND
+is not ported — the kernel supports it but there is no simple interface. Config is an
+optional `/mnt/para/smart265.cfg` (`ENABLE`, `LEVEL` 0/1/2, `GOP_SEC`, `CODEC`, `PATH_ID`,
+`INTERVAL`) on the persistent partition; defaults are `ENABLE=1 LEVEL=1`.
+
+### 6. AI models (`ppvd.bin`) are not portable across camera models
 
 Swapping in a `ppvd` AI model from a different Reolink camera makes the device fail to
 initialize entirely. The two models are compiled by **different generations of Novatek's NN
@@ -128,14 +149,16 @@ match. This is a format/toolchain incompatibility, not a memory or size limit.
 
 ## Final build
 
-Version `4073_2410201200`. rootfs 12,845,056 bytes (limit 13,107,200 — ~256 KB free).
+Version `4075_2410211800`. rootfs 12,845,056 bytes (limit 13,107,200 — ~256 KB free).
 
 Two PAK sections are modified; the kernel, uboot, and loader are untouched:
 
-- **FDT** — the 8 MB RAM re-split (section 1).
-- **rootfs** — ONVIF/RTSP enabled + boot self-heal, corridor mode + its AI model
-  (`/mnt/src/CNNLib/para/ppvd_corridor.bin`), and `support_corridor_mode="1"` in `dvr.xml`.
-  The telnet backdoor is removed; `trace.so` was never included.
+- **FDT** (section 1) — the 8 MB RAM re-split. Its `version.json` entry has `forbid_ol_up=0`
+  and `ver` bumped to `5772` so it is guaranteed to flash over whatever FDT is installed.
+- **rootfs** (section 6) — ONVIF/RTSP enabled + boot self-heal, corridor mode + its AI model
+  (`/mnt/src/CNNLib/para/ppvd_corridor.bin`) with `support_corridor_mode="1"`, and the
+  Intelligent H.265+ script (`/mnt/app/smart265.sh`) launched from `start_app`. The telnet
+  backdoor is removed; `trace.so` was never included.
 
 ### Build & flash
 
@@ -148,22 +171,24 @@ pakler -r -n 1 -f B800_fdt_8mshift.bin -o step1.pak \
     B800_IPC_5158M8M_V2_4057_2409132131_B800_8MP_REOLINK.pak
 
 # 2. replace the rootfs section
-pakler -r -n 6 -f B800_rootfs_CORRIDOR_4073_2410201200.bin \
-    -o B800_CORRIDOR_4073_2410201200.pak step1.pak
+pakler -r -n 6 -f B800_SMART265_4075_2410211800.bin \
+    -o B800_SMART265_4075.pak step1.pak
 ```
 
 > The firmware is flashed through the device's own upgrade mechanism, which honors the
 > per-section `forbid_ol_up` flag in `version.json`. The FDT section defaults to
-> `forbid_ol_up=1` (skipped on upgrade); set it to `0` — and bump the section `ver` above
-> what is currently installed — for the FDT to actually be written.
+> `forbid_ol_up=1` (skipped on upgrade); set it to `0` **and** bump the section `ver` above
+> what is currently installed for the FDT to actually be written. Each later build must keep
+> incrementing the FDT `ver` (5773, 5774, …) to keep overwriting.
 
 ### Verify after flashing
 
 ```sh
-cat /mnt/app/version_file      # expect 4073_2410201200
-free                           # confirms the RAM split that is active
-ps  | grep -E "onvif|rtsp"     # both running; bindshell absent in the final build
+cat /mnt/app/version_file      # expect 4075_2410211800
+free                           # ~45/49 MB confirms the re-split FDT took (not stock 41 MB)
+ps  | grep -E "onvif|rtsp|smart265"  # running; bindshell absent in the final build
 netstat -tlnp | grep -E "554|8000"   # both LISTEN
+cat /proc/vencrc/info          # main stream RC Mode -> EVBR (Intelligent H.265+ active)
 cat /proc/hdal/comm/info       # HDAL free memory — watch this when corridor AI runs
 ```
 
@@ -172,7 +197,8 @@ cat /proc/hdal/comm/info       # HDAL free memory — watch this when corridor A
 ## Known limits & notes
 
 - **Partition headroom is nearly gone** — ~256 KB free on the rootfs. The corridor AI model
-  consumed most of the space freed by removing the telnet backdoor.
+  consumed most of the space freed by removing the telnet backdoor; little room remains for
+  further additions.
 - **HDAL free memory is tight** (~5.5 MB with ONVIF/RTSP running, measured before corridor
   was added). Corridor-mode AI inference needs more HDAL, not less, so after enabling it,
   check `/proc/hdal/comm/info`; if free memory runs out, reduce the FDT shift (e.g. 8 MB →
@@ -192,6 +218,7 @@ cat /proc/hdal/comm/info       # HDAL free memory — watch this when corridor A
 - A pure-Python squashfs 4.0 (xz, 256 KB block) reader/rebuilder that preserves inode
   numbers, permissions, ownership, mtimes, and symlinks, and a verifier that diffs two
   images and checks xz-stream parameters against the kernel's squashfs constraints.
+- `smart265.sh` — the userspace Intelligent H.265+ port driving the EVBR/MAQ `/proc` knobs.
 - `bindshell2` (pty shell) and `trace.so` (`LD_PRELOAD` syscall tracer) for live diagnosis.
 - ARM32 disassembly via `llvm-objdump --triple=armv7-linux-gnueabihf` (the distro
   `objdump` lacked ARM support), plus manual PLT/GOT resolution for the stripped binaries.
